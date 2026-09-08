@@ -1,0 +1,283 @@
+import os
+import shutil
+import tempfile
+import threading
+import gc
+import queue
+from pathlib import Path
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
+from PIL import Image, ImageOps, UnidentifiedImageError
+
+# Pengaturan Tema & Warna CustomTkinter
+ctk.set_appearance_mode("Dark")  # Pilihan: "Dark", "Light", "System"
+ctk.set_default_color_theme("blue")  # Pilihan: "blue", "green", "dark-blue"
+
+# --- Fungsi konversi cm ke pixel berdasarkan DPI ---
+def cm_to_px(cm, dpi):
+    return int((cm / 2.54) * dpi)
+
+# --- Ukuran standar pasfoto (cm) ---
+UKURAN_CM = {
+    "2x3": (2, 3),
+    "3x4": (3, 4),
+    "4x6": (4, 6)
+}
+
+class FotoResizerApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("Foto Resizer Generator by Fawzia")
+        self.geometry("720x580")
+        self.resizable(False, False)
+
+        self.files = []
+        self.temp_dir = None
+        self.ui_queue = queue.Queue()
+
+        self.setup_ui()
+
+        # Mulai loop pemrosesan antrean UI
+        self.after(100, self.process_queue)
+
+    def setup_ui(self):
+        # Grid layout utama
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(3, weight=1)
+
+        # === 1. HEADER SECTION ===
+        self.header_frame = ctk.CTkFrame(self, corner_radius=10)
+        self.header_frame.grid(row=0, column=0, padx=15, pady=(15, 5), sticky="ew")
+
+        self.title_label = ctk.CTkLabel(
+            self.header_frame, 
+            text="📷 Foto Resizer Generator", 
+            font=ctk.CTkFont(size=20, weight="bold")
+        )
+        self.title_label.pack(side="left", padx=15, pady=12)
+
+        self.subtitle_label = ctk.CTkLabel(
+            self.header_frame, 
+            text="by Fawzia", 
+            font=ctk.CTkFont(size=12, slant="italic"),
+            text_color="gray"
+        )
+        self.subtitle_label.pack(side="left", pady=12)
+
+        # === 2. FILE SELECTION SECTION ===
+        self.file_frame = ctk.CTkFrame(self, corner_radius=10)
+        self.file_frame.grid(row=1, column=0, padx=15, pady=5, sticky="ew")
+
+        self.btn_folder = ctk.CTkButton(
+            self.file_frame, text="📁 Pilih Folder", command=self.pilih_folder, width=130
+        )
+        self.btn_folder.pack(side="left", padx=(15, 5), pady=10)
+
+        self.btn_files = ctk.CTkButton(
+            self.file_frame, text="🖼️ Pilih File (Multi)", command=self.pilih_files, width=140
+        )
+        self.btn_files.pack(side="left", padx=5, pady=10)
+
+        self.btn_clear = ctk.CTkButton(
+            self.file_frame, text="🗑️ Hapus Daftar", command=self.clear_list, 
+            fg_color="#D32F2F", hover_color="#9A0007", width=120
+        )
+        self.btn_clear.pack(side="right", padx=15, pady=10)
+
+        # === 3. LISTBOX SECTION ===
+        self.textbox_files = ctk.CTkTextbox(self, height=120, corner_radius=10)
+        self.textbox_files.grid(row=2, column=0, padx=15, pady=5, sticky="ew")
+        self.textbox_files.insert("1.0", "Belum ada file yang dipilih...\n")
+        self.textbox_files.configure(state="disabled")
+
+        # === 4. CONTROL OPTIONS SECTION ===
+        self.opts_frame = ctk.CTkFrame(self, corner_radius=10)
+        self.opts_frame.grid(row=3, column=0, padx=15, pady=5, sticky="ew")
+
+        # Pilihan Ukuran
+        self.lbl_ukuran = ctk.CTkLabel(self.opts_frame, text="Ukuran Foto:", font=ctk.CTkFont(weight="bold"))
+        self.lbl_ukuran.grid(row=0, column=0, padx=15, pady=12, sticky="w")
+
+        self.ukuran_var = ctk.StringVar(value="3x4")
+        self.radio_2x3 = ctk.CTkRadioButton(self.opts_frame, text="2x3 cm", variable=self.ukuran_var, value="2x3")
+        self.radio_2x3.grid(row=0, column=1, padx=10, pady=12)
+
+        self.radio_3x4 = ctk.CTkRadioButton(self.opts_frame, text="3x4 cm", variable=self.ukuran_var, value="3x4")
+        self.radio_3x4.grid(row=0, column=2, padx=10, pady=12)
+
+        self.radio_4x6 = ctk.CTkRadioButton(self.opts_frame, text="4x6 cm", variable=self.ukuran_var, value="4x6")
+        self.radio_4x6.grid(row=0, column=3, padx=10, pady=12)
+
+        # Input DPI
+        self.lbl_dpi = ctk.CTkLabel(self.opts_frame, text="DPI Target:", font=ctk.CTkFont(weight="bold"))
+        self.lbl_dpi.grid(row=0, column=4, padx=(20, 5), pady=12, sticky="w")
+
+        self.dpi_var = ctk.StringVar(value="300")
+        self.entry_dpi = ctk.CTkEntry(self.opts_frame, textvariable=self.dpi_var, width=70)
+        self.entry_dpi.grid(row=0, column=5, padx=(0, 15), pady=12)
+
+        # === 5. ACTION & PROGRESS SECTION ===
+        self.action_frame = ctk.CTkFrame(self, corner_radius=10)
+        self.action_frame.grid(row=4, column=0, padx=15, pady=5, sticky="ew")
+
+        self.btn_proses = ctk.CTkButton(
+            self.action_frame, text="🚀 Proses Ubah Ukuran", command=self.start_resize,
+            font=ctk.CTkFont(size=14, weight="bold"), height=38,
+            fg_color="#2E7D32", hover_color="#1B5E20"
+        )
+        self.btn_proses.pack(fill="x", padx=15, pady=(12, 8))
+
+        self.progress = ctk.CTkProgressBar(self.action_frame)
+        self.progress.pack(fill="x", padx=15, pady=5)
+        self.progress.set(0)
+
+        self.status_label = ctk.CTkLabel(self.action_frame, text="Status: Menunggu...", anchor="w")
+        self.status_label.pack(fill="x", padx=15, pady=(2, 10))
+
+        # === 6. LOG SECTION ===
+        self.log_box = ctk.CTkTextbox(self, height=100, corner_radius=10, font=ctk.CTkFont(size=11))
+        self.log_box.grid(row=5, column=0, padx=15, pady=(5, 15), sticky="ew")
+        self.log_box.insert("1.0", "System ready.\n")
+        self.log_box.configure(state="disabled")
+
+    # --- Thread Safe UI Handler ---
+    def process_queue(self):
+        try:
+            while True:
+                task = self.ui_queue.get_nowait()
+                action = task[0]
+                
+                if action == "log":
+                    self.append_log(task[1])
+                elif action == "progress":
+                    self.progress.set(task[1] / 100)
+                elif action == "status":
+                    self.status_label.configure(text=task[1])
+                elif action == "done":
+                    self.btn_proses.configure(state="normal")
+                    messagebox.showinfo("Selesai", task[1])
+                elif action == "error":
+                    self.btn_proses.configure(state="normal")
+                    messagebox.showerror("Error", task[1])
+                    
+                self.ui_queue.task_done()
+        except queue.Empty:
+            pass
+        self.after(100, self.process_queue)
+
+    # --- File Handler ---
+    def pilih_folder(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            p = Path(folder)
+            exts = ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG")
+            self.files = [f for ext in exts for f in p.glob(ext)]
+            self.update_file_list()
+
+    def pilih_files(self):
+        files = filedialog.askopenfilenames(filetypes=[("Image files", "*.jpg *.png *.jpeg *.JPG *.JPEG *.PNG")])
+        if files:
+            self.files = list(files)
+            self.update_file_list()
+
+    def update_file_list(self):
+        self.textbox_files.configure(state="normal")
+        self.textbox_files.delete("1.0", "end")
+        if not self.files:
+            self.textbox_files.insert("1.0", "Belum ada file yang dipilih...\n")
+        else:
+            for f in self.files:
+                self.textbox_files.insert("end", f"📷 {f}\n")
+        self.textbox_files.configure(state="disabled")
+
+    def clear_list(self):
+        self.files = []
+        self.update_file_list()
+
+    def append_log(self, msg):
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", msg + "\n")
+        self.log_box.configure(state="disabled")
+        self.log_box.see("end")
+
+    # --- Processing Logic ---
+    def start_resize(self):
+        if not self.files:
+            messagebox.showwarning("Peringatan", "Silakan pilih file atau folder terlebih dahulu!")
+            return
+
+        try:
+            dpi = int(self.dpi_var.get())
+            if dpi <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Error", "DPI harus berupa angka bulat positif!")
+            return
+
+        ukuran = self.ukuran_var.get()
+
+        self.btn_proses.configure(state="disabled")
+        self.status_label.configure(text="⏳ Memproses foto...")
+        self.progress.set(0)
+
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+
+        threading.Thread(target=self.do_resize, args=(ukuran, dpi), daemon=True).start()
+
+    def do_resize(self, ukuran_key, dpi):
+        try:
+            self.temp_dir = tempfile.mkdtemp(prefix="fotoresize_cache_")
+            ukuran_cm = UKURAN_CM[ukuran_key]
+            size_px = (cm_to_px(ukuran_cm[0], dpi), cm_to_px(ukuran_cm[1], dpi))
+
+            output_folder = Path(self.files[0]).parent / f"hasil_{ukuran_key}"
+            output_folder.mkdir(exist_ok=True)
+
+            total = len(self.files)
+            for i, fpath in enumerate(self.files, start=1):
+                try:
+                    with Image.open(fpath) as img:
+                        img = ImageOps.exif_transpose(img)
+
+                        if img.mode in ("RGBA", "P", "CMYK"):
+                            img = img.convert("RGB")
+
+                        # Fit & Crop Presisi
+                        img_resized = ImageOps.fit(img, size_px, method=Image.LANCZOS)
+                        
+                        temp_file = Path(self.temp_dir) / f"{Path(fpath).stem}.jpg"
+                        img_resized.save(temp_file, "JPEG", quality=95, dpi=(dpi, dpi))
+
+                        shutil.move(str(temp_file), str(output_folder / temp_file.name))
+                        self.ui_queue.put(("log", f"✅ {Path(fpath).name} -> {ukuran_key} ({size_px[0]}x{size_px[1]}px)"))
+
+                except UnidentifiedImageError:
+                    self.ui_queue.put(("log", f"⚠️ Bukan file gambar valid: {fpath}"))
+                except Exception as e:
+                    self.ui_queue.put(("log", f"❌ Error: {Path(fpath).name} ({e})"))
+
+                self.ui_queue.put(("progress", (i / total) * 100))
+
+            self.cleanup_cache()
+            self.ui_queue.put(("status", "✅ Proses selesai dan cache dibersihkan."))
+            self.ui_queue.put(("done", f"Semua foto berhasil diubah ke ukuran {ukuran_key}\nHasil disimpan di: {output_folder}"))
+
+        except Exception as e:
+            self.ui_queue.put(("error", str(e)))
+        finally:
+            gc.collect()
+
+    def cleanup_cache(self):
+        try:
+            if self.temp_dir and os.path.exists(self.temp_dir):
+                shutil.rmtree(self.temp_dir)
+                self.ui_queue.put(("log", "🧹 Cache sementara dibersihkan."))
+        except Exception as e:
+            self.ui_queue.put(("log", f"⚠️ Gagal bersihkan cache: {e}"))
+
+if __name__ == "__main__":
+    app = FotoResizerApp()
+    app.mainloop()
